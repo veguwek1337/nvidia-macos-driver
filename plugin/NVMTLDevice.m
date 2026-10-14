@@ -775,7 +775,7 @@ static char nvmtl_surface_cache_key;
     // Failed BAR imports use a private image. Repeated wrappers of the same
     // surface must share that image, just as successful family imports do.
     // Weak entries do not pin the image after the application's last wrapper.
-    if (backing && !backing->_vramOn) {
+    if (backing) {
         NVMTLTexture *alias = (NVMTLTexture *)[backing newTextureViewWithPixelFormat:d.pixelFormat];
         if (alias) {
             alias->_viewParent = nil; alias->_usage = d.usage; alias->_ropt = t->_ropt; alias->_fbo = t->_fbo;
@@ -792,7 +792,7 @@ static char nvmtl_surface_cache_key;
     t->_stex = t->_i.storage != 0;
     t->_usage = d.usage;
     nvmtl_texture_desc_swizzle(t, d);
-    if (key && !t->_vramOn) [cache setObject:t forKey:key];
+    if (key) [cache setObject:t forKey:key];
     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
           (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat);
     return t; }

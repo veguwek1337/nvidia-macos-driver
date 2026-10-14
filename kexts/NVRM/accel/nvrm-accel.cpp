@@ -1223,7 +1223,7 @@ static void nvFamUnlock(NVAccel *a)
     IOLockUnlock(*(IOLock *volatile *)((unsigned char *)a + 0x88));
 }
 static unsigned gNVSVLockMiss;
-enum { kNVSVPend = 512 };
+enum { kNVSVPend = 8192 };
 static unsigned gNVSVPendId[kNVSVPend];
 static NVResource *gNVSVPendResource[kNVSVPend];
 static IOSimpleLock *gNVSVPendLock;
@@ -1272,12 +1272,44 @@ static unsigned nvAccelSurfDirty(void *cache, NVResource *res, unsigned plane)
     volatile unsigned short *valid = *(unsigned short *volatile *)(r + 0x30);
     if (type != 0xc0 || (fl & 0x8000) || !valid || plane > 15) return NVRM_SS_NO_CACHE;
     if (!gNVSVPendLock) gNVSVPendLock = IOSimpleLockAlloc();
-    if (!nvSVPend(_ZNK9IOSurface12getSurfaceIDEv(*(void *volatile *)((unsigned char *)cache + 0x10)), 1, res)) return NVRM_SS_NO_CACHE;
+    nvSVPend(_ZNK9IOSurface12getSurfaceIDEv(*(void *volatile *)((unsigned char *)cache + 0x10)), 1, res);
     _ZN20IOSurfaceDeviceCache10setCurrentEv(cache);
     valid[6] |= (unsigned short)(1u << plane);
     valid[0] &= (unsigned short)~(1u << plane);
     return 0;
 }
+static void nvAccelUpdatePerfStats(NVAccel *a, uint64_t now)
+{
+    static uint64_t lastTick = 0;
+    static uint64_t lastFlips = 0, lastDirty = 0;
+    if (!a || !now) return;
+    if (lastTick && now > lastTick && (now - lastTick < 500000000ULL)) return;
+    uint64_t dt = (lastTick && now > lastTick) ? (now - lastTick) : 1000000000ULL;
+    lastTick = now;
+    uint64_t curFlips = (uint64_t)gCntIopFlip;
+    uint64_t curDirty = (uint64_t)gNVSVDirty;
+    uint64_t dFlips = curFlips >= lastFlips ? (curFlips - lastFlips) : 0;
+    uint64_t dDirty = curDirty >= lastDirty ? (curDirty - lastDirty) : 0;
+    lastFlips = curFlips;
+    lastDirty = curDirty;
+
+    unsigned pct = 0;
+    if (dFlips > 0 || dDirty > 0) {
+        unsigned est = (unsigned)((dFlips * 1000000000ULL / dt) * 100 / 240 + (dDirty * 1000000000ULL / dt) / 50);
+        pct = est > 100 ? 100 : (est < 1 && (dFlips || dDirty) ? 1 : est);
+    }
+    OSDictionary *stats = OSDynamicCast(OSDictionary, a->getProperty("PerformanceStatistics"));
+    if (stats) {
+        OSNumber *nUtil = OSNumber::withNumber(pct, 32);
+        if (nUtil) {
+            stats->setObject("Device Utilization %", nUtil);
+            stats->setObject("GPU Core Utilization", nUtil);
+            stats->setObject("GPU Activity(%)", nUtil);
+            nUtil->release();
+        }
+    }
+}
+
 static IOReturn nvAccelSurfVram(struct NVRMSurfShareEsc *p, task_t task, unsigned cmd)
 {
     p->hSrcClient = p->hSrcMemory = 0;
@@ -1298,11 +1330,13 @@ static IOReturn nvAccelSurfVram(struct NVRMSurfShareEsc *p, task_t task, unsigne
     NVResource *res = OSDynamicCast(NVResource, ctx);
     NVVidMemory *vm = res ? nvres_vidmem(res) : nullptr;
     if (cmd == NVRM_ESC_SURF_DIRTY) {
+        if (vm && !vm->fRmHandle && !vm->fScanout) _ZN16IOAccelVidMemory4wireEv(vm);
         p->status = (cache && res && vm && vm->fRmHandle) ? nvAccelSurfDirty(cache, res, p->plane) : NVRM_SS_NO_CACHE;
         if (p->status == 0) gNVSVDirty++; else gNVSVDirtyRefused++;
         if (gNVSVDirty + gNVSVDirtyRefused <= 6 || ((gNVSVDirty + gNVSVDirtyRefused) & 4095) == 0)
             ALOG("surfvram dirty: surface %u plane %u type 0x%x -> %#x (dirty %u, refused %u)", p->surfaceID, p->plane,
                  res ? (unsigned)((volatile unsigned char *)res)[0x14] : 0u, p->status, gNVSVDirty, gNVSVDirtyRefused);
+        nvAccelUpdatePerfStats(a, mach_absolute_time());
         if (cache) ((OSObject *)cache)->release();
         nvFamUnlock(a);
         ((OSObject *)surf)->release();
@@ -1606,6 +1640,7 @@ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pip
     if (n < 4 || n == 600 || (n & 0xffff) == 0)
         ALOG("iop: zero-copy swap #%lld head %u: surface 0x%x %llux%llu pitch %llu scanned out of its own VRAM (flipResult %d)",
              (long long)n + 1, head, s->getSurfaceID(), W, H, P, f.flipResult);
+    if (a) nvAccelUpdatePerfStats(a, mach_absolute_time());
     return true;
 }
 static int nvaccel_crc_sysctl SYSCTL_HANDLER_ARGS

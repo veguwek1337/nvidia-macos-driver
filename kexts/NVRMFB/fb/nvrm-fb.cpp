@@ -1140,7 +1140,22 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
                 NVRMNVDAFramebuffer *fb = gFBs[f];
                 if (!fb || fb->fDisplay != handles[i]) continue;
                 if (!dd->connected) { if (!fb->fDpyLost) FBLOG("hot-plug: display 0x%x went away (fb %u)", handles[i], fb->fIndex); fb->fDpyLost = true; }
-                else if (fb->fDpyLost && nrelight < sizeof relight / sizeof relight[0]) { fb->fDpyLost = false; fb->retain(); relight[nrelight++] = fb; }
+                else if (fb->fDpyLost && nrelight < sizeof relight / sizeof relight[0]) {
+                    fb->fDpyLost = false;
+                    fb->fSubmissionFaulted = false;
+                    fb->fSubmissionSeen = false;
+                    for (int k = 0; k < gNDpy; k++) {
+                        if (gDpy[k].handle == handles[i]) {
+                            gDpy[k].edidSize = dd->edid.bufferSize > sizeof gDpy[k].edid ? (NvU32)sizeof gDpy[k].edid : dd->edid.bufferSize;
+                            nvu_copy(gDpy[k].edid, dd->edid.buffer, gDpy[k].edidSize);
+                            fb->fEdidSize = (NvU16)(gDpy[k].edidSize > sizeof fb->fEdid ? sizeof fb->fEdid : gDpy[k].edidSize);
+                            nvu_copy(fb->fEdid, gDpy[k].edid, fb->fEdidSize);
+                            break;
+                        }
+                    }
+                    fb->retain();
+                    relight[nrelight++] = fb;
+                }
             }
             continue;
         }
@@ -1161,6 +1176,12 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
     for (unsigned f = 0; f < nrelight; f++) {
         NVRMNVDAFramebuffer *fb = relight[f];
         bool ok = !OSAddAtomic(0, &fb->fStopping) && !fb->fHeadSlept && fb->reflip();
+        if (ok) {
+            fb->handleEvent(kIOFBNotifyDidPowerOn);
+        } else if (!fb->fHeadSlept && fb->fReflip) {
+            uint64_t deadline; clock_interval_to_deadline(1000, kMillisecondScale, &deadline);
+            fb->scheduleCall(fb->fReflip, deadline);
+        }
         FBLOG("hot-plug: display 0x%x is back (fb %u): head %u lit again -> ok %u rc %d",
               fb->fDisplay, fb->fIndex, fb->fHead, (unsigned)ok, fb->fReflipRc);
         fb->release();
@@ -1225,7 +1246,10 @@ NvBool NVRMNVDAFramebuffer::submitConfig(struct NvKmsKapiRequestedModeSetConfig 
         const NvBool ok = fKms->applyModeSetConfig(fDev, cfg, rep, NV_TRUE);
         return ok && rep->flipResult == NV_KMS_FLIP_RESULT_SUCCESS;
     }
-    if (fSubmissionSeen) {
+    const bool modeReconfig = cfg->headRequestedConfig[fHead].flags.modeChanged ||
+                              cfg->headRequestedConfig[fHead].flags.displaysChanged ||
+                              cfg->headRequestedConfig[fHead].flags.activeChanged;
+    if (fSubmissionSeen && !modeReconfig) {
         // Initial console acceptance is asynchronous. A still-pending prior flip
         // must receive the same bounded completion wait as a newly committed flip.
         bool complete = false;
@@ -1315,6 +1339,8 @@ void NVRMNVDAFramebuffer::sampleFire(thread_call_param_t p0, thread_call_param_t
 }
 bool NVRMNVDAFramebuffer::reflip()
 {
+    fSubmissionFaulted = false;
+    fSubmissionSeen = false;
     NVRMDisplayGate gate; if (!gate.valid()) return false;
     if (!fKms || !fDev || !fSurf) return false;
     struct NvKmsKapiSurface *front = fFrontSurf ? fFrontSurf : fSurf;
@@ -1577,7 +1603,7 @@ uint64_t NVRMNVDAFramebuffer::vblPeriodAbs()
     uint64_t ns = 16666667ull;
     if (t.pixelClockHz && t.hTotal && t.vTotal) {
         const uint64_t q = (uint64_t)t.hTotal * t.vTotal * 1000000000ull / t.pixelClockHz;
-        if (q >= 4000000ull && q <= 50000000ull) ns = q;
+        if (q >= 1000000ull && q <= 50000000ull) ns = q;
     }
     uint64_t abs = 0; nanoseconds_to_absolutetime(ns, &abs); return abs;
 }
@@ -1616,7 +1642,9 @@ void NVRMNVDAFramebuffer::vblFire(thread_call_param_t p0, thread_call_param_t)
               (int)sFlipLatched[me->fHead], me->fModeSetTicks);
     }
     {   uint64_t nowv = 0; clock_get_uptime(&nowv); const uint64_t per = me->vblPeriodAbs();
-        const bool hwLive = me->fHwVblLast && nowv - me->fHwVblLast < 2 * per;
+        uint64_t grace = 0; nanoseconds_to_absolutetime(60000000ull, &grace); // 60 ms
+        if (grace < 8 * per) grace = 8 * per;
+        const bool hwLive = me->fHwVblCb && me->fHwVblLast && (nowv - me->fHwVblLast < grace);
         if (!hwLive && me->fVbl.proc) { me->fVbl.proc(me->fVbl.target, me->fVbl.ref); me->fVblCalls++; } }
     uint64_t period = 0, now = 0;
     period = me->vblPeriodAbs();
@@ -2612,6 +2640,7 @@ bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, 
                                    unsigned pitch, int *rcOut, bool pure, UInt64 cookie)
 {
     NVRMDisplayGate gate; if (!gate.valid() || fSubmissionFaulted) return false;
+    if (fDpyLost) return true;
     if (mem) {
         const UInt64 bytes = gAllocations.size(mem, cookie);
         if (!bytes || !w || !h || w > 65535 || h > 65535 || (UInt64)w * 4 > pitch || (UInt64)pitch * h > bytes) return false;
@@ -2780,6 +2809,9 @@ IOReturn NVRMNVDAFramebuffer::getAttribute(IOSelect attribute, uintptr_t *value)
         if (value) *value = v;
         FBLOG("getAttribute '%s' -> %lu (hardware cursor)", _s, (unsigned long)v);
         return kIOReturnSuccess;
+    }
+    if (attribute == FOUR_CHAR_CODE('hdcs')) {
+        return super::getAttribute(attribute, value);
     }
     IOReturn r = super::getAttribute(attribute, value);
     FBLOG("getAttribute '%s' -> 0x%x val %lu", _s, r, value ? (unsigned long)*value : 0ul);

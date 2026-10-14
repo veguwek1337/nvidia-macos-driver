@@ -1041,7 +1041,8 @@ NSData *nvmtl_translate_with_fc(NSString *ll, NSString *stage, const uint32_t *i
     if (!ll || !stage.length) { if (err) *err = @"no AIR kept for this function"; return nil; }
     uint8_t *out = NULL; size_t out_len = 0; char e[512] = {0};
     if (xlate_fc(ll.UTF8String, stage.UTF8String, idx, sizes, payloads, n, &out, &out_len, e, sizeof e) != 0) {
-        nvlog("function constants: re-translate FAILED: %s", e);
+        if (!strstr(e, "visible function reference") && !strstr(e, "visible function table"))
+            nvlog("function constants: re-translate FAILED: %s", e);
         if (err) *err = [NSString stringWithUTF8String:e[0] ? e : "specialization failed"];
         return nil;
     }

@@ -779,6 +779,17 @@ static NVMTLTexture *nvmtl_texbuf_make(NVMTLBuffer *b, MTLTextureDescriptor *d, 
     const BOOL brec = !noRecycle && _nbpk && nvmtl_bpark_take(self, bkey, &t->_i) == 0;
     if (!brec && nvmtl_vk_image_create_buffer_alias((uint32_t)w, (uint32_t)h, vkf, bpp, a8, (d.usage & MTLTextureUsageShaderWrite) != 0,
                                            (d.usage & MTLTextureUsageRenderTarget) != 0, &_b, offset, bpr, &t->_i)) {
+        void *base = [self contents];
+        if (base && d.textureType == MTLTextureType2D && offset + bpr * d.height <= _b.size) {
+            MTLTextureDescriptor *cd = [d copy]; cd.storageMode = MTLStorageModeShared;
+            id<MTLTexture> c = [[self device] newTextureWithDescriptor:cd];
+            if (c) {
+                [c replaceRegion:MTLRegionMake2D(0, 0, d.width, d.height) mipmapLevel:0 withBytes:(char *)base + offset bytesPerRow:bpr];
+                static int said; if (!said++) nvlog("buffer newTextureWithDescriptor: linear alias refused (offset %lu unaligned) -> copied standalone texture (%lux%lu bpr %lu; said once)",
+                                                      (unsigned long)offset, (unsigned long)d.width, (unsigned long)d.height, (unsigned long)bpr);
+                return c;
+            }
+        }
         nvlog("buffer newTextureWithDescriptor:offset:%lu bytesPerRow:%lu (%zux%zu fmt %lu, buffer %lu B, storage %lu) -> nil (reason above)",
               (unsigned long)offset, (unsigned long)bpr, w, h, (unsigned long)d.pixelFormat, (unsigned long)_b.size, (unsigned long)_storage);
         return nil; }
@@ -4734,7 +4745,11 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
 // normal submission-only contract.
 - (BOOL)commitAndWaitUntilSubmitted {
     static int ws = -1;
-    if (ws < 0) ws = (getprogname() && !strcmp(getprogname(), "WindowServer")) ? 1 : 0;
+    if (ws < 0) {
+        const char *e = getenv("NVMTL_WS_SUBMIT_ASYNC");
+        if (e && e[0] == '1') ws = 0;
+        else ws = (getprogname() && !strcmp(getprogname(), "WindowServer")) ? 1 : 0;
+    }
     [self commit];
     if (ws) [self waitUntilCompleted]; else [self waitUntilScheduled];
     return self.status != MTLCommandBufferStatusError;
